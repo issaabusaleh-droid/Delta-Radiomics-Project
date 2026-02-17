@@ -1,0 +1,18 @@
+import radiomics
+from radiomics import featureextractor
+
+# Configure extractor
+params = {
+    'binWidth': 0.1,           # for PET SUV
+    'resampledPixelSpacing': [2, 2, 2],
+    'interpolator': 'sitkBSpline',
+    'normalize': False,
+    'force2D': False,
+    'verbose': True
+}
+extractor = featureextractor.RadiomicsFeatureExtractor(**params)
+# Optionally enable/disable feature classes
+extractor.enableFeatureClassByName('firstorder')
+extractor.enableFeatureClassByName('glcm')
+extractor.enableFeatureClassByName('glrlm')
+# ... etc.
