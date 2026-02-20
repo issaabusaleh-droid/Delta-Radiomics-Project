@@ -1,0 +1,597 @@
+# ============================================================
+# DELTA-RADIOMICS MODEL FOR BREAST CANCER TREATMENT RESPONSE
+# ============================================================
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold
+from sklearn.preprocessing import StandardScaler
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.linear_model import LogisticRegression, LassoCV
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.svm import SVC
+from sklearn.metrics import (roc_auc_score, roc_curve, accuracy_score, 
+                             classification_report, confusion_matrix, f1_score)
+from scipy.stats import mannwhitneyu
+import SimpleITK as sitk
+from radiomics import featureextractor
+import warnings
+warnings.filterwarnings('ignore')
+
+# ============================================================
+# STEP 1: IMAGE PREPROCESSING
+# ============================================================
+
+class ImagePreprocessor:
+    """Preprocess PET/CT images for radiomics analysis"""
+    
+    def __init__(self, target_spacing=(1.0, 1.0, 1.0)):
+        self.target_spacing = target_spacing
+    
+    def resample_image(self, image, target_spacing=None):
+        """Resample image to isotropic spacing"""
+        if target_spacing is None:
+            target_spacing = self.target_spacing
+        
+        original_spacing = image.GetSpacing()
+        original_size = image.GetSize()
+        
+        target_size = [
+            int(round(osz * ospc / tspc))
+            for osz, ospc, tspc in zip(original_size, original_spacing, target_spacing)
+        ]
+        
+        resample = sitk.ResampleImageFilter()
+        resample.SetOutputSpacing(target_spacing)
+        resample.SetSize(target_size)
+        resample.SetOutputDirection(image.GetDirection())
+        resample.SetOutputOrigin(image.GetOrigin())
+        resample.SetTransform(sitk.Transform())
+        resample.SetDefaultPixelValue(image.GetPixelIDValue())
+        resample.SetInterpolator(sitk.sitkBSpline)
+        
+        return resample.Execute(image)
+    
+    def normalize_ct(self, image):
+        """Normalize CT image intensity"""
+        image_array = sitk.GetArrayFromImage(image)
+        # Clip to typical CT range
+        image_array = np.clip(image_array, -1000, 1000)
+        # Normalize to [0][1]
+        image_array = (image_array + 1000) / 2000
+        
+        normalized_image = sitk.GetImageFromArray(image_array)
+        normalized_image.CopyInformation(image)
+        return normalized_image
+    
+    def preprocess_pet_ct(self, ct_path, pet_path, mask_path):
+        """Complete preprocessing pipeline"""
+        # Load images
+        ct_image = sitk.ReadImage(ct_path)
+        pet_image = sitk.ReadImage(pet_path)
+        mask_image = sitk.ReadImage(mask_path)
+        
+        # Resample
+        ct_resampled = self.resample_image(ct_image)
+        pet_resampled = self.resample_image(pet_image)
+        mask_resampled = self.resample_image(mask_image)
+        
+        # Normalize CT
+        ct_normalized = self.normalize_ct(ct_resampled)
+        
+        return ct_normalized, pet_resampled, mask_resampled
+
+# ============================================================
+# STEP 2: RADIOMICS FEATURE EXTRACTION
+# ============================================================
+
+class RadiomicsExtractor:
+    """Extract radiomics features from PET/CT images"""
+    
+    def __init__(self):
+        # Initialize PyRadiomics extractor
+        self.extractor = featureextractor.RadiomicsFeatureExtractor()
+        
+        # Configure feature extraction
+        self.extractor.enableAllImageTypes()
+        self.extractor.enableAllFeatures()
+        
+        # Settings for reproducibility
+        settings = {
+            'binWidth': 25,
+            'resampledPixelSpacing': [1][1][1],
+            'interpolator': sitk.sitkBSpline,
+            'normalize': True,
+            'normalizeScale': 100
+        }
+        
+        for key, value in settings.items():
+            self.extractor.settings[key] = value
+    
+    def extract_features(self, image_path, mask_path):
+        """Extract features from single image"""
+        try:
+            result = self.extractor.execute(image_path, mask_path)
+            
+            # Filter only feature values (remove diagnostics)
+            features = {
+                key: value for key, value in result.items() 
+                if not key.startswith('diagnostics')
+            }
+            
+            return features
+        
+        except Exception as e:
+            print(f"Error extracting features: {e}")
+            return None
+    
+    def extract_baseline_followup(self, baseline_ct, baseline_pet, baseline_mask,
+                                   followup_ct, followup_pet, followup_mask):
+        """Extract features from baseline and follow-up scans"""
+        
+        # Extract baseline features
+        baseline_ct_features = self.extract_features(baseline_ct, baseline_mask)
+        baseline_pet_features = self.extract_features(baseline_pet, baseline_mask)
+        
+        # Extract follow-up features
+        followup_ct_features = self.extract_features(followup_ct, followup_mask)
+        followup_pet_features = self.extract_features(followup_pet, followup_mask)
+        
+        # Combine features
+        all_features = {
+            'baseline_ct': baseline_ct_features,
+            'baseline_pet': baseline_pet_features,
+            'followup_ct': followup_ct_features,
+            'followup_pet': followup_pet_features
+        }
+        
+        return all_features
+
+# ============================================================
+# STEP 3: DELTA-RADIOMICS CALCULATION
+# ============================================================
+
+class DeltaRadiomicsCalculator:
+    """Calculate delta-radiomics features"""
+    
+    @staticmethod
+    def calculate_delta(baseline_features, followup_features):
+        """Calculate delta features: (followup - baseline) / baseline * 100"""
+        delta_features = {}
+        
+        for key in baseline_features.keys():
+            if key in followup_features:
+                baseline_val = baseline_features[key]
+                followup_val = followup_features[key]
+                
+                # Avoid division by zero
+                if baseline_val != 0:
+                    delta = ((followup_val - baseline_val) / abs(baseline_val)) * 100
+                    delta_features[f'delta_{key}'] = delta
+        
+        return delta_features
+    
+    def calculate_all_deltas(self, baseline_ct, baseline_pet, followup_ct, followup_pet):
+        """Calculate deltas for CT and PET"""
+        delta_ct = self.calculate_delta(baseline_ct, followup_ct)
+        delta_pet = self.calculate_delta(baseline_pet, followup_pet)
+        
+        # Combine all features
+        all_features = {**baseline_ct, **baseline_pet, 
+                       **followup_ct, **followup_pet,
+                       **delta_ct, **delta_pet}
+        
+        return all_features
+
+# ============================================================
+# STEP 4: FEATURE SELECTION
+# ============================================================
+
+class FeatureSelector:
+    """Select most predictive features"""
+    
+    def __init__(self, correlation_threshold=0.9, p_value_threshold=0.05):
+        self.correlation_threshold = correlation_threshold
+        self.p_value_threshold = p_value_threshold
+        self.selected_features = None
+    
+    def remove_correlated_features(self, X):
+        """Remove highly correlated features"""
+        corr_matrix = X.corr().abs()
+        upper_triangle = corr_matrix.where(
+            np.triu(np.ones(corr_matrix.shape), k=1).astype(bool)
+        )
+        
+        to_drop = [
+            column for column in upper_triangle.columns 
+            if any(upper_triangle[column] > self.correlation_threshold)
+        ]
+        
+        return X.drop(columns=to_drop)
+    
+    def mann_whitney_test(self, X, y):
+        """Perform Mann-Whitney U test for feature selection"""
+        p_values = {}
+        
+        for column in X.columns:
+            group0 = X[y == 0][column]
+            group1 = X[y == 1][column]
+            
+            stat, p_value = mannwhitneyu(group0, group1, alternative='two-sided')
+            p_values[column] = p_value
+        
+        # Select features with p < threshold
+        significant_features = [
+            col for col, p in p_values.items() 
+            if p < self.p_value_threshold
+        ]
+        
+        return significant_features, p_values
+    
+    def lasso_selection(self, X, y, n_features=10):
+        """LASSO-based feature selection"""
+        # Standardize features
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X)
+        
+        # LASSO with cross-validation
+        lasso = LassoCV(cv=5, random_state=42, max_iter=10000)
+        lasso.fit(X_scaled, y)
+        
+        # Get feature importance
+        importance = np.abs(lasso.coef_)
+        
+        # Select top features
+        top_indices = np.argsort(importance)[-n_features:]
+        selected_features = X.columns[top_indices].tolist()
+        
+        return selected_features, importance
+    
+    def select_features(self, X, y, method='lasso', n_features=10):
+        """Complete feature selection pipeline"""
+        print(f"Initial features: {X.shape[1]}")
+        
+        # Step 1: Remove correlated features
+        X_uncorr = self.remove_correlated_features(X)
+        print(f"After correlation removal: {X_uncorr.shape[1]}")
+        
+        # Step 2: Statistical test
+        significant_features, p_values = self.mann_whitney_test(X_uncorr, y)
+        X_significant = X_uncorr[significant_features]
+        print(f"After statistical test: {X_significant.shape[1]}")
+        
+        # Step 3: LASSO or other method
+        if method == 'lasso':
+            selected_features, importance = self.lasso_selection(
+                X_significant, y, n_features
+            )
+        else:
+            selected_features = significant_features[:n_features]
+        
+        print(f"Final selected features: {len(selected_features)}")
+        self.selected_features = selected_features
+        
+        return X[selected_features], selected_features
+
+# ============================================================
+# STEP 5: MODEL TRAINING & EVALUATION
+# ============================================================
+
+class DeltaRadiomicsModel:
+    """Train and evaluate delta-radiomics models"""
+    
+    def __init__(self, random_state=42):
+        self.random_state = random_state
+        self.models = {}
+        self.results = {}
+        self.scaler = StandardScaler()
+        
+    def initialize_models(self):
+        """Initialize multiple classifiers"""
+        self.models = {
+            'Logistic Regression': LogisticRegression(
+                random_state=self.random_state, max_iter=1000
+            ),
+            'Random Forest': RandomForestClassifier(
+                n_estimators=100, random_state=self.random_state
+            ),
+            'SVM': SVC(
+                kernel='rbf', probability=True, random_state=self.random_state
+            ),
+            'Gradient Boosting': GradientBoostingClassifier(
+                n_estimators=100, random_state=self.random_state
+            )
+        }
+    
+    def train_evaluate_model(self, X_train, X_test, y_train, y_test, model_name):
+        """Train and evaluate single model"""
+        model = self.models[model_name]
+        
+        # Train
+        model.fit(X_train, y_train)
+        
+        # Predict
+        y_pred = model.predict(X_test)
+        y_pred_proba = model.predict_proba(X_test)[:, 1]
+        
+        # Evaluate
+        auc = roc_auc_score(y_test, y_pred_proba)
+        accuracy = accuracy_score(y_test, y_pred)
+        f1 = f1_score(y_test, y_pred)
+        
+        # Cross-validation
+        cv_scores = cross_val_score(
+            model, X_train, y_train, cv=5, scoring='roc_auc'
+        )
+        
+        results = {
+            'model': model,
+            'auc': auc,
+            'accuracy': accuracy,
+            'f1_score': f1,
+            'cv_auc_mean': cv_scores.mean(),
+            'cv_auc_std': cv_scores.std(),
+            'y_pred': y_pred,
+            'y_pred_proba': y_pred_proba,
+            'classification_report': classification_report(y_test, y_pred)
+        }
+        
+        return results
+    
+    def train_all_models(self, X, y, test_size=0.2):
+        """Train all models and compare"""
+        # Split data
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=test_size, random_state=self.random_state, stratify=y
+        )
+        
+        # Standardize features
+        X_train_scaled = self.scaler.fit_transform(X_train)
+        X_test_scaled = self.scaler.transform(X_test)
+        
+        # Initialize models
+        self.initialize_models()
+        
+        # Train and evaluate each model
+        print("\n" + "="*60)
+        print("MODEL TRAINING AND EVALUATION")
+        print("="*60)
+        
+        for model_name in self.models.keys():
+            print(f"\nTraining {model_name}...")
+            results = self.train_evaluate_model(
+                X_train_scaled, X_test_scaled, y_train, y_test, model_name
+            )
+            self.results[model_name] = results
+            
+            print(f"AUC: {results['auc']:.3f}")
+            print(f"Accuracy: {results['accuracy']:.3f}")
+            print(f"F1-Score: {results['f1_score']:.3f}")
+            print(f"CV AUC: {results['cv_auc_mean']:.3f} ± {results['cv_auc_std']:.3f}")
+        
+        # Store test data for visualization
+        self.X_test = X_test_scaled
+        self.y_test = y_test
+        
+        return self.results
+    
+    def plot_roc_curves(self):
+        """Plot ROC curves for all models"""
+        plt.figure(figsize=(10, 8))
+        
+        for model_name, results in self.results.items():
+            fpr, tpr, _ = roc_curve(self.y_test, results['y_pred_proba'])
+            auc = results['auc']
+            plt.plot(fpr, tpr, label=f"{model_name} (AUC = {auc:.3f})", linewidth=2)
+        
+        plt.plot([0][1], [0][1], 'k--', label='Random Classifier')
+        plt.xlabel('False Positive Rate', fontsize=12)
+        plt.ylabel('True Positive Rate', fontsize=12)
+        plt.title('ROC Curves - Delta-Radiomics Models', fontsize=14, fontweight='bold')
+        plt.legend(loc='lower right', fontsize=10)
+        plt.grid(alpha=0.3)
+        plt.tight_layout()
+        plt.show()
+    
+    def plot_feature_importance(self, feature_names, top_n=15):
+        """Plot feature importance for Random Forest"""
+        if 'Random Forest' not in self.results:
+            print("Random Forest model not trained")
+            return
+        
+        model = self.results['Random Forest']['model']
+        importance = model.feature_importances_
+        
+        # Sort features by importance
+        indices = np.argsort(importance)[-top_n:]
+        
+        plt.figure(figsize=(10, 8))
+        plt.barh(range(len(indices)), importance[indices], align='center')
+        plt.yticks(range(len(indices)), [feature_names[i] for i in indices])
+        plt.xlabel('Feature Importance', fontsize=12)
+        plt.title('Top Feature Importances - Random Forest', fontsize=14, fontweight='bold')
+        plt.tight_layout()
+        plt.show()
+    
+    def get_best_model(self):
+        """Get best performing model based on AUC"""
+        best_model_name = max(self.results, key=lambda x: self.results[x]['auc'])
+        best_results = self.results[best_model_name]
+        
+        print(f"\n{'='*60}")
+        print(f"BEST MODEL: {best_model_name}")
+        print(f"{'='*60}")
+        print(f"AUC: {best_results['auc']:.3f}")
+        print(f"Accuracy: {best_results['accuracy']:.3f}")
+        print(f"F1-Score: {best_results['f1_score']:.3f}")
+        print(f"\nClassification Report:")
+        print(best_results['classification_report'])
+        
+        return best_model_name, best_results
+
+# ============================================================
+# STEP 6: COMPLETE PIPELINE
+# ============================================================
+
+class DeltaRadiomicsPipeline:
+    """End-to-end pipeline for delta-radiomics analysis"""
+    
+    def __init__(self):
+        self.preprocessor = ImagePreprocessor()
+        self.extractor = RadiomicsExtractor()
+        self.delta_calculator = DeltaRadiomicsCalculator()
+        self.feature_selector = FeatureSelector()
+        self.model = DeltaRadiomicsModel()
+    
+    def run_pipeline(self, data_df, n_features=10):
+        """
+        Run complete pipeline
+        
+        Parameters:
+        -----------
+        data_df : DataFrame with columns:
+            - patient_id
+            - baseline_ct_path
+            - baseline_pet_path
+            - baseline_mask_path
+            - followup_ct_path
+            - followup_pet_path
+            - followup_mask_path
+            - label (0: non-pCR, 1: pCR)
+        n_features : number of features to select
+        """
+        
+        print("="*60)
+        print("DELTA-RADIOMICS PIPELINE - BREAST CANCER pCR PREDICTION")
+        print("="*60)
+        
+        # Step 1: Extract features for all patients
+        print("\n[1/5] Extracting radiomics features...")
+        all_features = []
+        
+        for idx, row in data_df.iterrows():
+            print(f"Processing patient {row['patient_id']}...")
+            
+            # Extract features
+            features = self.extractor.extract_baseline_followup(
+                row['baseline_ct_path'], row['baseline_pet_path'], 
+                row['baseline_mask_path'],
+                row['followup_ct_path'], row['followup_pet_path'], 
+                row['followup_mask_path']
+            )
+            
+            # Calculate delta features
+            delta_features = self.delta_calculator.calculate_all_deltas(
+                features['baseline_ct'], features['baseline_pet'],
+                features['followup_ct'], features['followup_pet']
+            )
+            
+            delta_features['label'] = row['label']
+            delta_features['patient_id'] = row['patient_id']
+            all_features.append(delta_features)
+        
+        # Convert to DataFrame
+        features_df = pd.DataFrame(all_features)
+        
+        # Separate features and labels
+        X = features_df.drop(columns=['label', 'patient_id'])
+        y = features_df['label']
+        
+        print(f"Extracted {X.shape[1]} features from {X.shape[0]} patients")
+        
+        # Step 2: Feature selection
+        print("\n[2/5] Performing feature selection...")
+        X_selected, selected_features = self.feature_selector.select_features(
+            X, y, method='lasso', n_features=n_features
+        )
+        
+        # Step 3: Train models
+        print("\n[3/5] Training models...")
+        results = self.model.train_all_models(X_selected, y)
+        
+        # Step 4: Visualize results
+        print("\n[4/5] Generating visualizations...")
+        self.model.plot_roc_curves()
+        self.model.plot_feature_importance(selected_features)
+        
+        # Step 5: Get best model
+        print("\n[5/5] Identifying best model...")
+        best_model_name, best_results = self.model.get_best_model()
+        
+        return {
+            'features_df': features_df,
+            'selected_features': selected_features,
+            'results': results,
+            'best_model': best_model_name,
+            'model_object': self.model
+        }
+
+# ============================================================
+# EXAMPLE USAGE
+# ============================================================
+
+def main():
+    """Example usage of the pipeline"""
+    
+    # Create sample dataset (replace with your actual data)
+    # This is just an example structure
+    data = {
+        'patient_id': ['P001', 'P002', 'P003'],
+        'baseline_ct_path': ['path/to/P001_baseline_CT.nii.gz', 
+                             'path/to/P002_baseline_CT.nii.gz',
+                             'path/to/P003_baseline_CT.nii.gz'],
+        'baseline_pet_path': ['path/to/P001_baseline_PET.nii.gz',
+                              'path/to/P002_baseline_PET.nii.gz',
+                              'path/to/P003_baseline_PET.nii.gz'],
+        'baseline_mask_path': ['path/to/P001_baseline_mask.nii.gz',
+                               'path/to/P002_baseline_mask.nii.gz',
+                               'path/to/P003_baseline_mask.nii.gz'],
+        'followup_ct_path': ['path/to/P001_followup_CT.nii.gz',
+                             'path/to/P002_followup_CT.nii.gz',
+                             'path/to/P003_followup_CT.nii.gz'],
+        'followup_pet_path': ['path/to/P001_followup_PET.nii.gz',
+                              'path/to/P002_followup_PET.nii.gz',
+                              'path/to/P003_followup_PET.nii.gz'],
+        'followup_mask_path': ['path/to/P001_followup_mask.nii.gz',
+                               'path/to/P002_followup_mask.nii.gz',
+                               'path/to/P003_followup_mask.nii.gz'],
+        'label': [1][0][1]  # 1 = pCR, 0 = non-pCR
+    }
+    
+    data_df = pd.DataFrame(data)
+    
+    # Initialize and run pipeline
+    pipeline = DeltaRadiomicsPipeline()
+    results = pipeline.run_pipeline(data_df, n_features=10)
+    
+    # Save results
+    results['features_df'].to_csv('delta_radiomics_features.csv', index=False)
+    
+    print("\n" + "="*60)
+    print("PIPELINE COMPLETED SUCCESSFULLY!")
+    print("="*60)
+    print(f"\nSelected Features: {results['selected_features']}")
+    print(f"Best Model: {results['best_model']}")
+
+# ============================================================
+# REQUIREMENTS
+# ============================================================
+"""
+Required packages:
+pip install numpy pandas matplotlib seaborn scikit-learn scipy
+pip install SimpleITK pyradiomics
+
+For GPU acceleration (optional):
+pip install xgboost lightgbm
+
+Data format:
+- Images: NIfTI format (.nii or .nii.gz)
+- CT: Hounsfield Units
+- PET: SUV normalized
+- Masks: Binary segmentation (1=tumor, 0=background)
+"""
+
+if __name__ == "__main__":
+    main()
